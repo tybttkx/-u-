@@ -1,6 +1,31 @@
+# =====================================================================
+# UnipusAI-Helper 依赖清单
+# ---------------------------------------------------------------------
+# 新电脑一键安装（全局 Python，无需虚拟环境），在本目录打开 CMD 执行：
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 不需要写在这里、也不需要手动装的东西：
+#   * Edge 浏览器驱动 —— selenium 4.10+ 自带 Selenium Manager，
+#     首次启动自动下载匹配的 msedgedriver，无需任何驱动包
+#   * FFmpeg —— 程序首次运行检测不到时会自动下载安装（见 EnvironmentChecker.py）
+#   * VB-Cable 虚拟声卡 —— 跟读题可选外设，非 pip 包，按使用手册手动安装
+# =====================================================================
+
+# ---- 浏览器自动化（驱动由 Selenium Manager 自动下载） ----
 selenium>=4.10.0
+
+# ---- 大模型接口（OpenAI 兼容格式，AI 作答/解析用） ----
 openai>=1.10.0
+
+# ---- 本地语音识别（听力/视频题转写；导入即加载，缺了程序起不来） ----
 openai-whisper>=20231117
 numpy<2.0.0
+# whisper 依赖 torch；Windows 下 PyPI 的 torch 就是 CPU 版（约 200MB），直接装即可
+torch>=2.0.0
+
+# ---- 图形界面 ----
 PyQt5>=5.15.0
 PyQt-Fluent-Widgets>=1.0.0
+
+# ---- 仅运行回归测试（test_smoke.py / test_knowledge_base.py）时需要 ----
+pytest
