@@ -82,11 +82,13 @@ _EAR_OFF_MIC_JS = (
 )
 
 #: 采集页面播放过的音频地址（大喇叭整段 + 平台自动播的 B 句都经过这里）
+#: 同时记录 'ended' 事件——B 句音频长达 16~20 秒，靠「多少秒没新播放」判断播完会误判。
 _CAPTURE_HOOK = r"""
 (function () {
   try {
     if (window.__rlHook) { return; }
     window.__rlUrls = [];
+    window.__rlEnds = [];
     var rec = function (src) {
       try {
         if (!src) { return; }
@@ -110,10 +112,44 @@ _CAPTURE_HOOK = r"""
       try { rec(this.currentSrc || this.src); } catch (e) {}
       return origPlay.apply(this, arguments);
     };
+    document.addEventListener('ended', function () {
+      try {
+        window.__rlEnds.push(Date.now());
+        if (window.__rlEnds.length > 80) { window.__rlEnds.shift(); }
+      } catch (x) {}
+    }, true);
     window.__rlHook = true;
   } catch (e) {}
 })();
 """
+
+
+def _is_my_audio_url(url: str, role: str) -> bool:
+    """URL 末尾的 name=A.mp3 / name=B.mp3 就是平台给的说话人标记（通用）。
+
+    实测两套对白都带：`..._96k.mp3#duration=4.776000&size=95565&name=A.mp3`；
+    个别文件写作 `name=2-4%20A.mp3`（前缀无关，只看结尾的 A/B）。
+    """
+    try:
+        frag = str(url).split('#')[-1]
+        if 'name=' not in frag:
+            return False
+        name = frag.split('name=', 1)[1]
+        return name.upper().endswith(role.upper() + '.MP3')
+    except Exception:
+        return False
+
+
+def _pick_my_urls(urls, role: str, wanted: int) -> list:
+    """从采集到的音频里挑出本人角色的台词音频（按播放顺序）。
+
+    优先用 URL 里的 name=A/B 标记；没有标记的老结构退回「A/B 交替取偶数位」。
+    """
+    mine = [u for u in urls if _is_my_audio_url(u, role)]
+    if mine:
+        return mine[:wanted]
+    alt = [u for i, u in enumerate(urls) if i % 2 == 0]
+    return alt[:wanted]
 
 
 def is_role_play_page(driver) -> bool:
@@ -250,21 +286,30 @@ def listen_whole_dialogue(driver, verbose=True) -> list:
     got = _click_el(driver, driver.find_element(By.CSS_SELECTOR, TRUMPET_SEL), verbose)
     if verbose:
         print('     Role-play：点大喇叭，等整段播完…（%s）' % ('已点' if got else '点了没反应'))
+    # 播完判定：必须见过至少一次 ended 事件，且之后 4.5 秒没有新播放/新结束。
+    # （B 句音频长达 16~20 秒，用「N 秒没动静」判会把它误当成播完——实测少采 3 段。）
     quiet = 0.0
     last_n = 0
+    last_end = 0
     t0 = time.time()
-    while time.time() - t0 < 180:
+    while time.time() - t0 < 240:
         time.sleep(1.5)
         try:
             n = len(driver.execute_script("return window.__rlUrls || [];") or [])
         except Exception:
-            n = 0
-        if n != last_n:
-            last_n = n
+            n = last_n
+        try:
+            e = len(driver.execute_script("return window.__rlEnds || [];") or [])
+        except Exception:
+            e = last_end
+        if n != last_n or e != last_end:
+            last_n, last_end = n, e
             quiet = 0.0
         else:
             quiet += 1.5
-        if n >= 4 and quiet >= 6.0:
+        if e >= 1 and quiet >= 4.5:
+            break
+        if n >= 2 and quiet >= 20.0:      # 兜底：彻底没动静 20 秒
             break
         if n == 0 and time.time() - t0 > 30:
             break
@@ -290,24 +335,113 @@ def _download(url: str) -> str:
         return ''
 
 
-def _switch_cable(verbose=True):
-    """跳到 VB-Cable 回环（跟读题同款）；返回是否切换（失败也继续，调用方只打印）。"""
+#: UIA 兜底切设备：打开「设置 → 声音」，按名字选中播放/录音的单选按钮。
+#: COM（IPolicyConfig）在本机会间歇性抽风（0x80004002），这项兜底实测可靠。
+_UIA_SELECT_PS1 = '''# role_play 兜底：用设置界面的 UIA 选择默认播放/录音设备
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$UIA = [System.Windows.Automation.AutomationElement]
+Start-Process 'ms-settings:sound'
+Start-Sleep -Seconds 4
+$root = $UIA::RootElement
+$wins = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+$dlg = $null
+foreach ($w in $wins) { try { if ($w.Current.Name -match '^设置$|^Settings$') { $dlg = $w; break } } catch {} }
+if (-not $dlg) { Write-Output 'NO-WINDOW'; exit 2 }
+$all = $dlg.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+$want = @('__OUT__', '__IN__')
+$found = 0
+foreach ($el in $all) {
+    try {
+        if ($el.Current.ControlType.ProgrammaticName -eq 'ControlType.RadioButton') {
+            $nm = $el.Current.Name
+            foreach ($t in $want) {
+                if ($nm -eq $t) {
+                    $el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+                    $found++
+                }
+            }
+        }
+    } catch {}
+}
+Write-Output ('SELECTED=' + $found)
+Start-Sleep -Seconds 2
+'''
+
+
+def _uia_set_devices(out_name: str, in_name: str, verbose=True) -> bool:
+    """UIA 兜底：把默认播放/录音设备选成指定名字（约 10 秒）。"""
+    import tempfile
     try:
-        import audio_route
-        ok = audio_route.use_vb_cable(verbose=verbose)
-        return bool(ok)
+        p = os.path.join(tempfile.gettempdir(), 'uc_uia_devices.ps1')
+        script = _UIA_SELECT_PS1.replace('__OUT__', out_name).replace('__IN__', in_name)
+        with io.open(p, 'w', encoding='utf-8-sig', newline='') as f:
+            f.write(script)
+        r = subprocess.run(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', p],
+                           capture_output=True, timeout=150)
+        out = (r.stdout or b'').decode('utf-8', errors='replace')
+        if verbose:
+            print('     Role-play：UIA 切设备 [%s / %s] → %s'
+                  % (out_name, in_name, out.strip().replace('\n', ' ')[:80]))
+        return 'SELECTED=2' in out
     except Exception as exc:
         if verbose:
-            print('     Role-play：VB-Cable 切换不可用（%s）' % str(exc)[:60])
+            print('     Role-play：UIA 切设备失败（%s）' % str(exc)[:60])
         return False
 
 
-def _restore_devices(verbose=True):
+def _devices_match(want_render: str, want_capture: str) -> bool:
     try:
         import audio_route
+        return (audio_route._default_id(0) == want_render
+                and audio_route._default_id(1) == want_capture)
+    except Exception:
+        return False
+
+
+def _switch_cable(verbose=True) -> bool:
+    """切 VB-Cable 回环并验证（COM 会抽风：重试 3 次 + UIA 兜底）。"""
+    try:
+        import audio_route
+    except Exception as exc:
+        if verbose:
+            print('     Role-play：audio_route 不可用（%s）' % str(exc)[:50])
+        return False
+    for attempt in range(3):
+        try:
+            audio_route.use_vb_cable(verbose=(verbose and attempt == 0))
+        except Exception:
+            pass
+        if _devices_match(audio_route.CABLE_IN_ID, audio_route.CABLE_OUT_ID):
+            if verbose:
+                print('     Role-play：VB-Cable 回环就绪（播放→CABLE In，录音→CABLE Out）')
+            return True
+        time.sleep(1)
+    if _uia_set_devices('CABLE Input', 'CABLE Output', verbose) \
+            and _devices_match(audio_route.CABLE_IN_ID, audio_route.CABLE_OUT_ID):
+        if verbose:
+            print('     Role-play：VB-Cable 回环就绪（UIA 兜底）')
+        return True
+    if verbose:
+        print('     Role-play：⚠ VB-Cable 没切全 —— 录音可能收不到声音（分数会受影响）')
+    return False
+
+
+def _restore_devices(verbose=True):
+    """切回真实设备并验证（同样带 UIA 兜底）。"""
+    try:
+        import audio_route
+    except Exception:
+        return
+    try:
         audio_route.use_real_devices(verbose=verbose)
     except Exception:
         pass
+    if _devices_match(audio_route.REAL_SPK_ID, audio_route.REAL_MIC_ID):
+        return
+    if _uia_set_devices('扬声器', '立体声混音', verbose) \
+            and verbose:
+        print('     Role-play：已切回真实设备（UIA 兜底）')
 
 
 def run_role_play(driver, role: str = 'A', verbose: bool = True) -> bool:
@@ -340,10 +474,10 @@ def run_role_play(driver, role: str = 'A', verbose: bool = True) -> bool:
 
     # ① 整段听（强制），同时采集每句音频地址
     urls = listen_whole_dialogue(driver, verbose)
-    my_urls = [u for i, u in enumerate(urls) if i % 2 == 0][:len(my_numbers)]
+    my_urls = _pick_my_urls(urls, role, len(my_numbers))
     if len(my_urls) < len(my_numbers):
         if verbose:
-            print('     Role-play：音频没采齐（%d/%d），仍继续'
+            print('     Role-play：本人音频没采齐（%d/%d），仍继续'
                   % (len(my_urls), len(my_numbers)))
     # 下载本人句子（跟读题同款：先备好音频，窗口里直接播）
     payloads = []
@@ -409,7 +543,7 @@ def run_role_play(driver, role: str = 'A', verbose: bool = True) -> bool:
                     if verbose:
                         print('     Role-play：第 %d 个窗口没开（本轮结束）' % (k + 1))
                     break
-                if payloads[k]:
+                if k < len(payloads) and payloads[k]:
                     # ★ 起录延迟缓冲：窗口「开」只是 UI 状态，平台录音管线还要
                     #   0.8~2.8 秒才真正在录（逐词着色实测：开头的词被录丢）。
                     #   先等 4 秒让录音跑起来，再播整句 —— take 开头留点静音无妨，
@@ -420,6 +554,8 @@ def run_role_play(driver, role: str = 'A', verbose: bool = True) -> bool:
                     except Exception as exc:
                         if verbose:
                             print('     Role-play：播放失败（%s）' % str(exc)[:50])
+                elif verbose:
+                    print('     Role-play：第 %d 句没有音频可播（采集不全）' % my_numbers[k])
                 if verbose:
                     print('     Role-play：窗口 %d 开录 → 播第 %d 句'
                           % (k + 1, my_numbers[k]))
