@@ -6864,6 +6864,19 @@ class AISolver:
             self._preprocess_audio_if_needed(tab_name, l1_idx, l2_idx)
             if self._should_stop():
                 return False
+            # Role-play 题（选角色 + 平台引导式连录）：结构独特，走专用模块 role_play.py。
+            # 情境步解析不出任何题目、跟读步又没有逐句麦克风（整页一个 .record-seat，
+            # 平台自动开录音窗口连录）——必须在解析前拦下来。专用流程没做成时落回原流程。
+            try:
+                from role_play import is_role_play_page, run_role_play
+                if is_role_play_page(self.driver):
+                    print("\n    🎭 Role-play 题：走专用流程（听完 → 点麦 → 窗口连录）")
+                    if run_role_play(self.driver):
+                        print("    🎭 Role-play：全部录成 ✔")
+                        return True
+                    print("    ⚠ Role-play：专用流程没做成，按普通题流程继续")
+            except Exception as exc:
+                print(f"    Role-play 专用流程异常（{str(exc)[:60]}），按普通题流程继续")
             # Sample 页：先停留够时间并进入它的 Practicing（实测必须走这一步）
             if page_num == 1 and self._handle_sample_dwell(tab_name):
                 if self._should_stop():

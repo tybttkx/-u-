@@ -1791,6 +1791,78 @@ def test_harvest_replaces_same_page_block_despite_title_drift():
     assert "### Exercise 2" in replaced2, "指纹沾边但内容不同的另一页块被误删了"
 
 
+def test_role_play_page_detection_and_row_helpers():
+    """Role-play 专用流程的地基：页面识别（含情境步/面包屑）、读角色、读评分。
+
+    2026-10-13 实测：情境步（「Situation: I can't find my way!」+ 下一题）时
+    .question-role-play 还没渲染，只有面包屑写着 Role-play——识别必须覆盖它，
+    否则模块在最关键的第一步就被拦下（实测刷新后返回 False 就是这个原因）。
+    """
+    import role_play
+
+    class FakeEl:
+        def __init__(self, text=''):
+            self.text = text
+
+        def find_element(self, by, sel):
+            if sel == '.role':
+                return FakeEl(text='A')
+            if sel == '.score':
+                return FakeEl(text='87')
+            raise Exception('找不到: ' + sel)
+
+    class FakeDriver:
+        def __init__(self, page):
+            self.page = page
+
+        def find_elements(self, by, sel):
+            if sel == '.question-role-play':
+                return [object()] if self.page == 'question' else []
+            if sel == '.role-play-wrapper, .role-list, .role-reply':
+                return [object()] if self.page == 'reply' else []
+            if sel == '.ant-breadcrumb':
+                if self.page == 'situation':
+                    return [FakeEl(text='新视野大学英语（测试）> Get from A to B > Role-play')]
+                return []
+            return []
+
+    assert role_play.is_role_play_page(FakeDriver('question')) is True
+    assert role_play.is_role_play_page(FakeDriver('situation')) is True, '情境步必须能识别'
+    assert role_play.is_role_play_page(FakeDriver('reply')) is True
+    assert role_play.is_role_play_page(FakeDriver('none')) is False
+
+    row = FakeEl()
+    assert role_play._row_role(row) == 'A'
+    assert role_play._row_score_num(row) == 87
+
+
+def test_role_play_recorder_state_and_pass_line():
+    """录音状态读取（.ucomp-recorder 的 disabled 类 = 不在录）与 60 分及格线。
+
+    录音窗口检测全靠这个类：'ucomp-recorder'（活跃=在录）/'ucomp-recorder disabled'。
+    """
+    import role_play
+
+    class RecEl:
+        def __init__(self, cls):
+            self._cls = cls
+
+        def get_attribute(self, name):
+            return self._cls if name == 'class' else ''
+
+    class D:
+        def __init__(self, cls):
+            self.cls = cls
+
+        def find_element(self, by, sel):
+            assert sel == '.ucomp-recorder', sel
+            return RecEl(self.cls)
+
+    assert role_play.PASS_SCORE == 60
+    assert role_play._recording(D('ucomp-recorder disabled')) is False
+    assert role_play._recording(D('ucomp-recorder')) is True
+
+
 if __name__ == "__main__":
     tests = [
         test_answer_executor_returns_bool,
@@ -1846,6 +1918,8 @@ if __name__ == "__main__":
         test_face_evidence_only_lists_confirmed,
         test_harvest_splits_inline_letter_answers,
         test_letter_answers_survive_wordbank_gate_on_dropdown,
+        test_role_play_page_detection_and_row_helpers,
+        test_role_play_recorder_state_and_pass_line,
     ]
     failed = skipped = 0
     for test in tests:
