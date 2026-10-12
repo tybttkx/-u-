@@ -1,0 +1,15 @@
+logs/
+__pycache__/
+*.pyc
+.idea/
+.venv/
+net10.0-windows/
+build/
+dist/
+release/
+config.json
+# 换钥/改配置时留下的备份同样是明文凭据，一并忽略（打包分享前也请检查）
+config.json.bak*
+
+# 建库工作缓存：答案截图与清单（体积大，且是原始素材，知识库以 md 为准）
+.cache/
